@@ -220,12 +220,16 @@ type Signature = sp_core::sr25519::Signature;
 /// be aware of using the right crypto type when using `sp_keyring` and similar crates.
 type AccountId = sp_core::sr25519::Public;
 
+type Balance = u32;
+
 #[derive(
 	Debug, Encode, Decode, TypeInfo, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize,
 )]
 enum Call {
 	SetValue { value: u32 },
 	UpgradeCode { code: Vec<u8> },
+	Transfer { from: AccountId, to: AccountId, amount: u32 },
+	SetBalance { who: AccountId, new_balance: Balance },
 }
 
 #[derive(TypeInfo, Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
@@ -376,7 +380,25 @@ impl Runtime {
 	/// In our template, we call into this from both block authoring, and block import.
 	pub(crate) fn do_apply_extrinsic(ext: <Block as BlockT>::Extrinsic) -> ApplyExtrinsicResult {
 		let dispatch_outcome = match ext.clone().function {
-			_ => Ok(()),
+			Call::SetValue { value } => Ok(sp_io::storage::set(VALUE_KEY, &value.encode())),
+			Call::UpgradeCode { code: _ } => Ok(()),
+			Call::Transfer { from, to, amount } => {
+				Self::mutate_state(&from, |from_balance: &mut Balance| {
+					if amount > *from_balance {
+						return;
+					}
+					*from_balance -= amount;
+				});
+
+				Self::mutate_state(&to, |to_balance: &mut Balance| {
+					*to_balance += amount;
+				});
+				Ok(())
+			},
+			Call::SetBalance { who, new_balance } => {
+				sp_io::storage::set(&who, &new_balance.encode());
+				Ok(())
+			},
 		};
 
 		log::debug!(target: LOG_TARGET, "dispatched {:?}, outcome = {:?}", ext, dispatch_outcome);
@@ -584,7 +606,7 @@ impl_runtime_apis! {
 mod tests {
 	use super::*;
 	use parity_scale_codec::Encode;
-	use sp_core::hexdisplay::HexDisplay;
+	use sp_core::{hexdisplay::HexDisplay, sr25519::Public, Pair};
 	use sp_io::TestExternalities;
 	use sp_runtime::traits::Extrinsic as _;
 
@@ -737,6 +759,36 @@ mod tests {
 		let mut import_state = TestExternalities::new_empty();
 		import_block(block, &mut import_state);
 		import_state.execute_with(|| assert_eq!(Runtime::get_state::<u32>(VALUE_KEY), Some(79)));
+	}
+
+	#[test]
+	fn test_balance_transfer_success() {
+		// create two accounts
+        let alice = sp_core::sr25519::Pair::from_string("//Alice", None).unwrap();
+		let bob = sp_core::sr25519::Pair::from_string("//Bob", None).unwrap();
+		let from = alice.public();
+		let to = bob.public();
+		let amount = 100;
+
+		// set the balance of the two accounts
+		let ext1 = SignedExtrinsic::new(Call::SetBalance { who: from, new_balance: 200 }, None).unwrap();
+		let ext2 = SignedExtrinsic::new(Call::SetBalance { who: to, new_balance: 0 }, None).unwrap();
+		let ext3 = SignedExtrinsic::new(Call::Transfer { from, to, amount }, None).unwrap();
+
+		// author the block with the set balance extrinsics and assert the initial values of the accounts
+		let mut authoring_state = TestExternalities::new_empty();
+		let _ = author_block(vec![ext1, ext2], &mut authoring_state);
+		authoring_state.execute_with(|| {
+			assert_eq!(Runtime::get_state::<u32>(&from), Some(200));
+			assert_eq!(Runtime::get_state::<u32>(&to), Some(0));
+		});
+
+		// author the block with the transfer extrinsic and assert the final values of the accounts
+		let _ = author_block(vec![ext3], &mut authoring_state);
+		authoring_state.execute_with(|| {
+			assert_eq!(Runtime::get_state::<u32>(&from), Some(100));
+			assert_eq!(Runtime::get_state::<u32>(&to), Some(100));
+		});
 	}
 
 	#[test]
